@@ -1,138 +1,123 @@
 import cv2
 import numpy as np
+import matplotlib.pyplot as plt
 
-# === 1. Load the frame ===
-frame = cv2.imread("first_frame.bmp")
-if frame is None:
-    raise FileNotFoundError("Could not read 'first_fram.bmp'")
+# === Load and prepare ===
+img = cv2.imread("first_frame.bmp")
+if img is None:
+    raise FileNotFoundError("Could not open first_frame.bmp")
 
-frame = cv2.resize(frame, (960, 540))
-height, width = frame.shape[:2]
+h, w = img.shape[:2]
 
-# === 2. Color masking for white & yellow lanes ===
-hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-white_mask = cv2.inRange(hsv, (0, 0, 200), (180, 40, 255))
-yellow_mask = cv2.inRange(hsv, (15, 80, 80), (40, 255, 255))
-mask = cv2.bitwise_or(white_mask, yellow_mask)
-masked = cv2.bitwise_and(frame, frame, mask=mask)
+# Use only bottom half
+roi = img[h//2:h, :].copy()
+roi_h, roi_w = roi.shape[:2]
 
-# === 3. Preprocess: grayscale, blur, morphology, edges ===
-gray = cv2.cvtColor(masked, cv2.COLOR_BGR2GRAY)
-blur = cv2.GaussianBlur(gray, (5, 5), 0)
-kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-clean = cv2.morphologyEx(blur, cv2.MORPH_CLOSE, kernel, iterations=2)
-edges = cv2.Canny(clean, 50, 150)
+# === Preprocess ===
+gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+blur = cv2.GaussianBlur(gray, (5,5), 0)
+edges = cv2.Canny(blur, 50, 150)
 
-# === 4. Define ROI ===
-roi_mask = np.zeros_like(edges)
-roi_vertices = np.array([[
-    (int(0.1 * width), height),
-    (int(0.9 * width), height),
-    (int(0.6 * width), int(0.6 * height)),
-    (int(0.4 * width), int(0.6 * height))
-]], dtype=np.int32)
-cv2.fillPoly(roi_mask, roi_vertices, 255)
-cropped = cv2.bitwise_and(edges, roi_mask)
+# === Detect line segments ===
+lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50,
+                        minLineLength=40, maxLineGap=40)
 
-# === 5. Detect lines (Hough Transform) ===
-lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 40,
-                        minLineLength=40, maxLineGap=60)
+left_lines, right_lines, vertical_edges = [], [], []
 
-# === 6. Separate left/right lines ===
-left_lines, right_lines = [], []
 if lines is not None:
-    for x1, y1, x2, y2 in lines[:, 0]:
+    for l in lines:
+        x1, y1, x2, y2 = l[0]
         if x2 == x1:
-            continue
-        slope = (y2 - y1) / (x2 - x1)
-        if slope < -0.4:
-            left_lines.append((x1, y1, x2, y2))
-        elif slope > 0.4:
-            right_lines.append((x1, y1, x2, y2))
+            slope = np.inf
+        else:
+            slope = (y2 - y1) / (x2 - x1)
 
-# === 7. Average each lane ===
-def average_lane(lines):
-    if not lines:
-        return None
-    xs, ys = [], []
-    for x1, y1, x2, y2 in lines:
-        xs += [x1, x2]
-        ys += [y1, y2]
-    fit = np.polyfit(ys, xs, 1)  # x = a*y + b
-    y1, y2 = height, int(height * 0.6)
-    x1, x2 = int(fit[0] * y1 + fit[1]), int(fit[0] * y2 + fit[1])
-    return (x1, y1, x2, y2)
+        # Classify lines by slope
+        if slope == np.inf or abs(slope) > 5:
+            vertical_edges.append((x1, y1, x2, y2))  # sidewalk/curb
+        elif slope < -0.3:
+            left_lines.append((x1, y1, x2, y2, slope))
+        elif slope > 0.3:
+            right_lines.append((x1, y1, x2, y2, slope))
+        else:
+            # shallow slopes near sides → possible sidewalk edge
+            if x1 < roi_w*0.25 or x2 < roi_w*0.25 or x1 > roi_w*0.75 or x2 > roi_w*0.75:
+                vertical_edges.append((x1, y1, x2, y2))
 
-left_avg = average_lane(left_lines)
-right_avg = average_lane(right_lines)
+# === Helper: find intersection with bottom ===
+def x_at_bottom(x1, y1, x2, y2):
+    if x2 == x1:
+        return x1
+    m = (y2 - y1) / (x2 - x1)
+    y = roi_h - 1
+    x = x1 + (y - y1) / m
+    return int(np.clip(x, 0, roi_w - 1))
 
-# === 8. Draw lanes + center path ===
-output = frame.copy()
-lane_center_x = None
+# Compute averaged x positions at bottom
+right_xs = [x_at_bottom(x1, y1, x2, y2) for (x1, y1, x2, y2, _) in right_lines]
+left_xs = [x_at_bottom(x1, y1, x2, y2) for (x1, y1, x2, y2, _) in left_lines]
 
-if left_avg is not None:
-    cv2.line(output, (left_avg[0], left_avg[1]), (left_avg[2], left_avg[3]), (0, 255, 0), 8)
-if right_avg is not None:
-    cv2.line(output, (right_avg[0], right_avg[1]), (right_avg[2], right_avg[3]), (0, 255, 0), 8)
-
-if left_avg and right_avg:
-    mid_bottom = ((left_avg[0] + right_avg[0]) // 2, height)
-    mid_top = ((left_avg[2] + right_avg[2]) // 2, int(height * 0.6))
-    lane_center_x = mid_bottom[0]
-    cv2.line(output, mid_bottom, mid_top, (255, 0, 0), 8)
-elif left_avg:
-    dx = int(width * 0.25)
-    lane_center_x = left_avg[0] + dx
-    cv2.line(output, (left_avg[0] + dx, height), (left_avg[2] + dx, int(height * 0.6)), (255, 0, 0), 8)
-elif right_avg:
-    dx = int(width * 0.25)
-    lane_center_x = right_avg[0] - dx
-    cv2.line(output, (right_avg[0] - dx, height), (right_avg[2] - dx, int(height * 0.6)), (255, 0, 0), 8)
-
-# === 9. Compute steering value ===
-steering_value = 0.0
-steering_text = "No lane detected"
-
-if lane_center_x is not None:
-    frame_center_x = width // 2
-    deviation = lane_center_x - frame_center_x
-    steering_value = deviation / (width / 2)  # normalize to [-1, 1]
-    steering_value = np.clip(steering_value, -1.0, 1.0)
-
-    # Interpret steering command
-    if abs(steering_value) < 0.1:
-        steering_text = "Go Straight"
-        color = (0, 255, 0)
-    elif steering_value > 0.1:
-        steering_text = f"Turn Right ({steering_value:.2f})"
-        color = (0, 255, 255)
-    else:
-        steering_text = f"Turn Left ({steering_value:.2f})"
-        color = (0, 0, 255)
-
-    # Draw arrow
-    cv2.arrowedLine(
-        output,
-        (frame_center_x, height),
-        (int(lane_center_x), int(height * 0.8)),
-        color, 5, tipLength=0.3
-    )
+# === Estimate lane center ===
+if right_xs and left_xs:
+    right_bot = int(np.mean(right_xs))
+    left_bot = int(np.mean(left_xs))
+    lane_center_x = (right_bot + left_bot) // 2
+    note = "both lanes detected"
+elif right_xs:
+    right_bot = int(np.mean(right_xs))
+    left_bot = right_bot - int(roi_w * 0.25)
+    lane_center_x = (right_bot + max(0, left_bot)) // 2
+    note = "only right lane detected; left estimated"
+elif left_xs:
+    left_bot = int(np.mean(left_xs))
+    right_bot = left_bot + int(roi_w * 0.25)
+    lane_center_x = (left_bot + min(roi_w - 1, right_bot)) // 2
+    note = "only left lane detected; right estimated"
 else:
-    color = (0, 0, 255)
+    lane_center_x = roi_w * 3 // 4 - roi_w // 8
+    note = "no clear lane lines; fallback used"
 
-# === 10. Annotate output ===
-cv2.putText(output, steering_text, (40, 80),
-            cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3, cv2.LINE_AA)
-cv2.putText(output, f"Steering Value: {steering_value:+.2f}", (40, 130),
-            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+# === Compute steering ===
+image_center_x = roi_w // 2
+steering_pixels = int(lane_center_x - image_center_x)
+steering_norm = steering_pixels / (roi_w / 2)
+steering_norm = max(-1.0, min(1.0, steering_norm))  # clamp
 
-# === 11. Display ===
-cv2.imshow("Free Way + Steering Output", output)
-cv2.imwrite("first_frame_out.bmp", output)
+# === Annotate ===
+annot = roi.copy()
+
+# Draw detected lines
+for (x1, y1, x2, y2, _) in left_lines:
+    cv2.line(annot, (x1, y1), (x2, y2), (0, 200, 0), 3)   # green = left lane
+for (x1, y1, x2, y2, _) in right_lines:
+    cv2.line(annot, (x1, y1), (x2, y2), (0, 0, 200), 3)   # blue = right lane
+for (x1, y1, x2, y2) in vertical_edges:
+    cv2.line(annot, (x1, y1), (x2, y2), (0, 200, 200), 2) # cyan = sidewalk
+
+# Draw centers
+cv2.line(annot, (image_center_x, 0), (image_center_x, roi_h-1), (255, 0, 255), 2)  # magenta
+cv2.line(annot, (int(lane_center_x), 0), (int(lane_center_x), roi_h-1), (0, 0, 0), 3)
+cv2.line(annot, (int(lane_center_x), 0), (int(lane_center_x), roi_h-1), (0, 0, 255), 2)
+
+# Add info text
+text1 = f"Steering px: {steering_pixels}, norm: {steering_norm:.3f}"
+cv2.putText(annot, text1, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+cv2.putText(annot, note, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
+
+# Replace ROI in original frame
+out = img.copy()
+out[h//2:h, :] = annot
+
+# Save and/or display
+cv2.imwrite("annotated_frame.png", out)
+
+# Optional: show
+plt.figure(figsize=(10,6))
+plt.imshow(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
+plt.axis("off")
+plt.title("Annotated frame - lanes and sidewalk edges")
+plt.show()
+
+print(f"Steering pixels: {steering_pixels}, normalized: {steering_norm:.3f}")
 cv2.waitKey(0)
 cv2.destroyAllWindows()
-
-# Optional: save
-cv2.imwrite("free_way_with_steering.png", output)
-
-print(f"Steering Value: {steering_value:+.2f} ({steering_text})")
